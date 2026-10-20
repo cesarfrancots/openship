@@ -5,7 +5,7 @@ import { getOfficePreviewKind, renderOfficePreview } from './office-preview';
 const zipBytes = async (files: Record<string, string>) => {
   const zip = new JSZip();
   for (const [path, content] of Object.entries(files)) zip.file(path, content);
-  return zip.generateAsync({ type: 'uint8array' });
+  return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
 };
 
 describe('getOfficePreviewKind', () => {
@@ -49,6 +49,46 @@ describe('renderOfficePreview', () => {
     const csv = 'a,"b,""c"""\n' + Array.from({ length: 600 }, (_, i) => `${i},x`).join('\n');
     const html = await renderOfficePreview('csv', new TextEncoder().encode(csv), 'a.csv');
     expect(html).toContain('<td>b,&quot;c&quot;</td>');
-    expect(html).toContain('Preview limited');
+    expect(html).toContain('preview is incomplete');
+  });
+
+  it('reads cells without references, phonetic guides and prefixed namespaces', async () => {
+    const data = await zipBytes({
+      'xl/workbook.xml':
+        '<x:workbook><x:sheets><x:sheet name="S" r:id="rId1"/></x:sheets></x:workbook>',
+      'xl/_rels/workbook.xml.rels':
+        '<Relationships><Relationship Id="rId1" Target="/xl/worksheets/sheet1.xml"/></Relationships>',
+      'xl/sharedStrings.xml':
+        '<x:sst><x:si><x:t>漢字</x:t><x:rPh sb="0" eb="2"><x:t>カンジ</x:t></x:rPh></x:si></x:sst>',
+      'xl/worksheets/sheet1.xml':
+        '<x:worksheet><x:sheetData><x:row><x:c t="s"><x:v>0</x:v></x:c><x:c><x:v>8</x:v></x:c></x:row><x:row r="3"><x:c t="inlineStr"><x:is><x:t>&#x110000;</x:t></x:is></x:c></x:row></x:sheetData></x:worksheet>',
+    });
+    const html = await renderOfficePreview('xlsx', data, 'a.xlsx');
+    expect(html).toContain('<tr><td>漢字</td><td>8</td></tr><tr></tr><tr><td>\uFFFD</td></tr>');
+  });
+
+  it('keeps textbox text once and ignores tab stop definitions', async () => {
+    const data = await zipBytes({
+      'word/document.xml':
+        '<w:document><w:body><w:p><w:pPr><w:tabs><w:tab w:val="left"/></w:tabs></w:pPr><w:r><w:t>Before </w:t></w:r><w:r><mc:AlternateContent><mc:Choice><w:txbxContent><w:p><w:r><w:t>Box</w:t></w:r></w:p></w:txbxContent></mc:Choice><mc:Fallback><w:txbxContent><w:p><w:r><w:t>Box</w:t></w:r></w:p></w:txbxContent></mc:Fallback></mc:AlternateContent></w:r><w:r><w:t xml:space="preserve"> After</w:t></w:r></w:p></w:body></w:document>',
+    });
+    expect(await renderOfficePreview('docx', data, 'a.docx')).toContain('<p>Before Box After</p>');
+  });
+
+  it('stays fast on unclosed tags and stops reading oversized entries', async () => {
+    const unclosed = await zipBytes({
+      'word/document.xml': '<w:p>'.repeat(5000) + '<'.repeat(20000) + 'x'.repeat(1_000_000),
+    });
+    let start = performance.now();
+    await renderOfficePreview('docx', unclosed, 'a.docx');
+    expect(performance.now() - start).toBeLessThan(1000);
+
+    const bomb = await zipBytes({
+      'word/document.xml': `<w:p><w:r><w:t>${'x'.repeat(64 * 1024 * 1024)}</w:t></w:r></w:p>`,
+    });
+    start = performance.now();
+    const html = await renderOfficePreview('docx', bomb, 'a.docx');
+    expect(html).toContain('preview is incomplete');
+    expect(performance.now() - start).toBeLessThan(3000);
   });
 });

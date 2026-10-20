@@ -467,10 +467,12 @@ const openAttachment = async (
     }
     const byteArray = new Uint8Array(byteNumbers);
     const officeKind = getOfficePreviewKind(attachment.mimeType, attachment.filename);
-    const blob = officeKind
-      ? new Blob([await renderOfficePreview(officeKind, byteArray, attachment.filename)], {
-          type: 'text/html',
-        })
+    // Encrypted or mislabeled files cannot be previewed; hand them over as before.
+    const preview = officeKind
+      ? await renderOfficePreview(officeKind, byteArray, attachment.filename).catch(() => null)
+      : null;
+    const blob = preview
+      ? new Blob([preview], { type: 'text/html' })
       : new Blob([byteArray], { type: attachment.mimeType });
     const url = window.URL.createObjectURL(blob);
 

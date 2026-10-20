@@ -2,6 +2,9 @@ import JSZip from 'jszip';
 
 const MAX_ROWS = 500;
 const MAX_COLUMNS = 50;
+const MAX_SHEETS = 20;
+const MAX_XML_BYTES = 8 * 1024 * 1024;
+const MAX_DEPTH = 256;
 
 const XLSX_TYPES = ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
 const DOCX_TYPES = ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
@@ -29,20 +32,122 @@ const escapeHtml = (value: string) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-const decodeXml = (value: string) =>
-  value
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(parseInt(code, 10)))
-    .replace(/&amp;/g, '&');
+const XML_ENTITIES = new Map([
+  ['lt', '<'],
+  ['gt', '>'],
+  ['quot', '"'],
+  ['apos', "'"],
+  ['amp', '&'],
+]);
 
-const collectText = (xml: string, tag: string) =>
-  [...xml.matchAll(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'g'))]
-    .map((match) => decodeXml(match[1] ?? ''))
+const decodeXml = (value: string) =>
+  value.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (entity, body: string) => {
+    if (!body.startsWith('#')) return XML_ENTITIES.get(body) ?? entity;
+    const code = /^#x/i.test(body) ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+    return code <= 0x10ffff ? String.fromCodePoint(code) : '�';
+  });
+
+type XmlNode = { name: string; attributes: Map<string, string>; children: (XmlNode | string)[] };
+
+// Attachments come from any sender, so this must stay linear: no pattern can
+// scan past the next `<`, and unclosed or stray tags are tolerated, not searched for.
+const XML_TOKEN = /<(\/?)([^\s/<>]+)((?:\s[^<>]*?)?)(\/?)>|([^<]+)/g;
+const XML_ATTRIBUTE = /([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+
+const localName = (name: string) => name.slice(name.indexOf(':') + 1);
+
+const parseXml = (xml: string) => {
+  const root: XmlNode = { name: '', attributes: new Map(), children: [] };
+  const stack = [root];
+  for (const [, closing, rawName, rawAttributes, selfClosing, text] of xml.matchAll(XML_TOKEN)) {
+    const parent = stack.at(-1) ?? root;
+    if (text !== undefined) {
+      parent.children.push(decodeXml(text));
+      continue;
+    }
+    if (!rawName || rawName.startsWith('?') || rawName.startsWith('!')) continue;
+    const name = localName(rawName);
+    if (closing) {
+      const index = stack.findLastIndex((node) => node.name === name);
+      if (index > 0) stack.length = index;
+      continue;
+    }
+    const node: XmlNode = {
+      name,
+      attributes: new Map(
+        [...(rawAttributes ?? '').matchAll(XML_ATTRIBUTE)].map(
+          ([, key = '', doubleQuoted, singleQuoted]) => [
+            localName(key),
+            decodeXml(doubleQuoted ?? singleQuoted ?? ''),
+          ],
+        ),
+      ),
+      children: [],
+    };
+    parent.children.push(node);
+    if (!selfClosing && stack.length < MAX_DEPTH) stack.push(node);
+  }
+  return root;
+};
+
+const elements = (node: XmlNode) =>
+  node.children.filter((child): child is XmlNode => typeof child !== 'string');
+
+/** Depth-first matches of `name`, without looking inside a match. */
+const descendants = (node: XmlNode, name: string): XmlNode[] =>
+  elements(node).flatMap((child) => (child.name === name ? [child] : descendants(child, name)));
+
+const plainText = (node: XmlNode): string =>
+  node.children.map((child) => (typeof child === 'string' ? child : plainText(child))).join('');
+
+const SKIPPED_TEXT_ELEMENTS = new Set(['pPr', 'rPr', 'rPh', 'Fallback']);
+
+const textOf = (node: XmlNode): string =>
+  elements(node)
+    .map((child) => {
+      if (child.name === 't') return plainText(child);
+      if (child.name === 'tab') return '\t';
+      if (child.name === 'br' || child.name === 'cr') return '\n';
+      // Properties hold tab-stop definitions; phonetic guides and the legacy copy
+      // of a textbox would repeat visible text.
+      if (SKIPPED_TEXT_ELEMENTS.has(child.name)) return '';
+      return textOf(child);
+    })
     .join('');
+
+type StreamableZipObject = JSZip.JSZipObject & {
+  internalStream: (type: 'uint8array') => JSZip.JSZipStreamHelper<Uint8Array>;
+};
+
+// A few KB of DEFLATE can inflate to gigabytes, so stop reading at the cap.
+const readCapped = (file: StreamableZipObject) =>
+  new Promise<{ chunks: Uint8Array[]; truncated: boolean }>((resolve, reject) => {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    const stream = file.internalStream('uint8array');
+    stream
+      .on('data', (chunk) => {
+        if (size >= MAX_XML_BYTES) return;
+        chunks.push(chunk.subarray(0, MAX_XML_BYTES - size));
+        size += chunk.length;
+        if (size >= MAX_XML_BYTES) {
+          stream.pause();
+          resolve({ chunks, truncated: true });
+        }
+      })
+      .on('error', reject)
+      .on('end', () => resolve({ chunks, truncated: false }))
+      .resume();
+  });
+
+const readXml = async (zip: JSZip, path: string) => {
+  const file = zip.file(path) as StreamableZipObject | null;
+  if (!file) return { root: parseXml(''), truncated: false };
+  const { chunks, truncated } = await readCapped(file);
+  const decoder = new TextDecoder();
+  const xml = chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join('');
+  return { root: parseXml(xml + decoder.decode()), truncated };
+};
 
 const columnIndex = (reference: string) => {
   let index = 0;
@@ -52,114 +157,108 @@ const columnIndex = (reference: string) => {
   return index - 1;
 };
 
-const renderTable = (rows: string[][], truncated: boolean) => {
-  const body = rows
+const INCOMPLETE_NOTE =
+  '<p class="note">This preview is incomplete. Download the file to see everything.</p>';
+
+const renderTable = (rows: string[][]) =>
+  `<table>${rows
     .map((row) => `<tr>${row.map((cell) => `<td>${escapeHtml(cell)}</td>`).join('')}</tr>`)
-    .join('');
-  const notice = truncated
-    ? `<p class="note">Preview limited to the first ${MAX_ROWS} rows and ${MAX_COLUMNS} columns. Download the file to see everything.</p>`
-    : '';
-  return `<table>${body}</table>${notice}`;
-};
+    .join('')}</table>`;
 
 const parseXlsx = async (data: Uint8Array) => {
   const zip = await JSZip.loadAsync(data);
-  const read = (path: string) => zip.file(path)?.async('string') ?? Promise.resolve('');
-
-  const sharedStrings = [
-    ...(await read('xl/sharedStrings.xml')).matchAll(/<si>([\s\S]*?)<\/si>/g),
-  ].map((match) => collectText(match[1] ?? '', 't'));
-
-  const relationships = new Map(
-    [...(await read('xl/_rels/workbook.xml.rels')).matchAll(/<Relationship\s[^>]*>/g)].map(
-      (match) => [
-        /\sId="([^"]*)"/.exec(match[0])?.[1] ?? '',
-        /\sTarget="([^"]*)"/.exec(match[0])?.[1] ?? '',
-      ],
-    ),
+  const workbook = await readXml(zip, 'xl/workbook.xml');
+  const relationships = await readXml(zip, 'xl/_rels/workbook.xml.rels');
+  const sharedStringsXml = await readXml(zip, 'xl/sharedStrings.xml');
+  const sharedStrings = descendants(sharedStringsXml.root, 'si').map(textOf);
+  const targets = new Map(
+    descendants(relationships.root, 'Relationship').map((relationship) => [
+      relationship.attributes.get('Id') ?? '',
+      relationship.attributes.get('Target') ?? '',
+    ]),
   );
-
-  const sheets = [...(await read('xl/workbook.xml')).matchAll(/<sheet\s[^>]*>/g)].map((match) => ({
-    name: decodeXml(/\sname="([^"]*)"/.exec(match[0])?.[1] ?? 'Sheet'),
-    target: relationships.get(/\sr:id="([^"]*)"/.exec(match[0])?.[1] ?? '') ?? '',
-  }));
+  const sheets = descendants(workbook.root, 'sheet');
+  let incomplete =
+    workbook.truncated ||
+    relationships.truncated ||
+    sharedStringsXml.truncated ||
+    sheets.length > MAX_SHEETS;
 
   const rendered: string[] = [];
-  for (const sheet of sheets) {
-    const path = sheet.target.startsWith('/')
-      ? sheet.target.slice(1)
-      : `xl/${sheet.target.replace(/^\.?\//, '')}`;
-    const xml = await read(path);
+  for (const sheet of sheets.slice(0, MAX_SHEETS)) {
+    const target = targets.get(sheet.attributes.get('id') ?? '') ?? '';
+    const path = target.startsWith('/') ? target.slice(1) : `xl/${target.replace(/^\.?\//, '')}`;
+    const { root, truncated } = await readXml(zip, path);
+    incomplete ||= truncated;
     const rows: string[][] = [];
-    let truncated = false;
 
-    for (const rowMatch of xml.matchAll(/<row\b[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g)) {
+    for (const row of descendants(root, 'row')) {
+      const rowNumber = Number(row.attributes.get('r'));
+      while (Number.isInteger(rowNumber) && rows.length < Math.min(rowNumber - 1, MAX_ROWS)) {
+        rows.push([]);
+      }
       if (rows.length >= MAX_ROWS) {
-        truncated = true;
+        incomplete = true;
         break;
       }
-      const row: string[] = [];
-      for (const cellMatch of (rowMatch[1] ?? '').matchAll(
-        /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g,
-      )) {
-        const attributes = cellMatch[1] ?? '';
-        const content = cellMatch[2] ?? '';
-        const column = columnIndex(/\sr="([^"]*)"/.exec(` ${attributes}`)?.[1] ?? '');
+      const cells: string[] = [];
+      let column = -1;
+      for (const cell of elements(row).filter((child) => child.name === 'c')) {
+        const reference = cell.attributes.get('r');
+        column = reference ? columnIndex(reference) : column + 1;
         if (column < 0) continue;
         if (column >= MAX_COLUMNS) {
-          truncated = true;
-          continue;
+          incomplete = true;
+          break;
         }
-        const type = /\st="([^"]*)"/.exec(` ${attributes}`)?.[1];
-        const value = collectText(content, 'v');
+        const type = cell.attributes.get('t');
+        const value = descendants(cell, 'v').map(plainText).join('');
         let text = value;
         if (type === 's') text = sharedStrings[Number(value)] ?? '';
-        else if (type === 'inlineStr') text = collectText(content, 't');
+        else if (type === 'inlineStr') text = descendants(cell, 'is').map(textOf).join('');
         else if (type === 'b') text = value === '1' ? 'TRUE' : 'FALSE';
-        while (row.length < column) row.push('');
-        row[column] = text;
+        while (cells.length < column) cells.push('');
+        cells[column] = text;
       }
-      rows.push(row);
+      rows.push(cells);
     }
 
-    rendered.push(`<h2>${escapeHtml(sheet.name)}</h2>${renderTable(rows, truncated)}`);
+    rendered.push(
+      `<h2>${escapeHtml(sheet.attributes.get('name') ?? 'Sheet')}</h2>${renderTable(rows)}`,
+    );
   }
-  return rendered.join('') || '<p class="note">This workbook has no sheets.</p>';
+  return (
+    (rendered.join('') || '<p class="note">This workbook has no sheets.</p>') +
+    (incomplete ? INCOMPLETE_NOTE : '')
+  );
 };
+
+const cellText = (cell: XmlNode) => descendants(cell, 'p').map(textOf).join('\n');
+
+const renderDocxBlocks = (node: XmlNode): string =>
+  elements(node)
+    .map((child) => {
+      if (child.name === 'tbl') {
+        return renderTable(
+          descendants(child, 'tr').map((row) => descendants(row, 'tc').map(cellText)),
+        );
+      }
+      if (child.name !== 'p') return renderDocxBlocks(child);
+      const text = textOf(child);
+      if (!text.trim()) return '';
+      const style = descendants(child, 'pStyle')[0]?.attributes.get('val') ?? '';
+      const tag = /^(heading|title)/i.test(style) ? 'h2' : 'p';
+      return `<${tag}>${escapeHtml(text)}</${tag}>`;
+    })
+    .join('');
 
 const parseDocx = async (data: Uint8Array) => {
   const zip = await JSZip.loadAsync(data);
-  const xml = (await zip.file('word/document.xml')?.async('string')) ?? '';
-
-  const paragraphText = (paragraph: string) =>
-    paragraph
-      .replace(/<w:tab\s*\/>/g, '\t')
-      .replace(/<w:(?:br|cr)\s*\/>/g, '\n')
-      .replace(/<(?!\/?w:t[\s>])[^>]*>/g, '')
-      .replace(/<w:t(?:\s[^>]*)?>/g, '')
-      .replace(/<\/w:t>/g, '');
-
-  const blocks = [...xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>|<w:p\b[^>]*>[\s\S]*?<\/w:p>/g)].map(
-    (match) => {
-      const block = match[0];
-      if (block.startsWith('<w:tbl>')) {
-        const rows = [...block.matchAll(/<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/g)].map((row) =>
-          [...(row[1] ?? '').matchAll(/<w:tc>([\s\S]*?)<\/w:tc>/g)].map((cell) =>
-            [...(cell[1] ?? '').matchAll(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g)]
-              .map((paragraph) => decodeXml(paragraphText(paragraph[0])))
-              .join('\n'),
-          ),
-        );
-        return renderTable(rows, false);
-      }
-      const text = decodeXml(paragraphText(block));
-      const heading = /<w:pStyle\s+w:val="(?:Heading|Title)/i.test(block);
-      return text.trim()
-        ? `<${heading ? 'h2' : 'p'}>${escapeHtml(text)}</${heading ? 'h2' : 'p'}>`
-        : '';
-    },
+  const { root, truncated } = await readXml(zip, 'word/document.xml');
+  return (
+    (renderDocxBlocks(root) || '<p class="note">This document has no text.</p>') +
+    (truncated ? INCOMPLETE_NOTE : '')
   );
-  return blocks.join('') || '<p class="note">This document has no text.</p>';
 };
 
 const parseCsv = (text: string) => {
@@ -189,10 +288,10 @@ const parseCsv = (text: string) => {
     if (rows.length > MAX_ROWS) break;
   }
   if (cell || row.length) rows.push([...row, cell]);
-  const truncated = rows.length > MAX_ROWS || rows.some((r) => r.length > MAX_COLUMNS);
-  return renderTable(
-    rows.slice(0, MAX_ROWS).map((r) => r.slice(0, MAX_COLUMNS)),
-    truncated,
+  const incomplete = rows.length > MAX_ROWS || rows.some((r) => r.length > MAX_COLUMNS);
+  return (
+    renderTable(rows.slice(0, MAX_ROWS).map((r) => r.slice(0, MAX_COLUMNS))) +
+    (incomplete ? INCOMPLETE_NOTE : '')
   );
 };
 
