@@ -112,10 +112,8 @@ void app.whenReady().then(async () => {
       );
       await downloaded;
       assert.equal(await readFile(output, "utf8"), payload);
-      assert.ok(
-        popups.every((popup) => popup.isDestroyed()),
-        "Unsafe previews close their reserved popup",
-      );
+      // Renderer Window.close() completes asynchronously on Linux.
+      await until(() => popups.every((popup) => popup.isDestroyed()));
       popups.length = 0;
     }
     const text = `<script>${script}</script>`;
