@@ -49,6 +49,7 @@ import { useThread } from '@/hooks/use-threads';
 import { BimiAvatar } from '../ui/bimi-avatar';
 import { RenderLabels } from './render-labels';
 import { cleanHtml } from '@/lib/email-utils';
+import { getInlineAttachmentType } from '@/lib/inline-attachment';
 import { MailContent } from './mail-content';
 import { m } from '@/paraglide/messages';
 import { useParams } from 'react-router';
@@ -467,13 +468,21 @@ const openAttachment = async (
     }
     const byteArray = new Uint8Array(byteNumbers);
     const officeKind = getOfficePreviewKind(attachment.mimeType, attachment.filename);
-    // Encrypted or mislabeled files cannot be previewed; hand them over as before.
+    // Encrypted or mislabeled files cannot be previewed; download them instead.
     const preview = officeKind
       ? await renderOfficePreview(officeKind, byteArray, attachment.filename).catch(() => null)
       : null;
+    const inlineType = getInlineAttachmentType(attachment.mimeType);
     const blob = preview
       ? new Blob([preview], { type: 'text/html' })
-      : new Blob([byteArray], { type: attachment.mimeType });
+      : inlineType
+        ? new Blob([byteArray], { type: inlineType })
+        : null;
+    if (!blob) {
+      pendingPopup?.close();
+      await downloadAttachment(attachment);
+      return;
+    }
     const url = window.URL.createObjectURL(blob);
 
     const popup = pendingPopup === undefined ? openAttachmentViewer() : pendingPopup;
