@@ -48,6 +48,7 @@ import { useThread } from '@/hooks/use-threads';
 import { BimiAvatar } from '../ui/bimi-avatar';
 import { RenderLabels } from './render-labels';
 import { cleanHtml } from '@/lib/email-utils';
+import { getInlineAttachmentType } from '@/lib/inline-attachment';
 import { MailContent } from './mail-content';
 import { m } from '@/paraglide/messages';
 import { useParams } from 'react-router';
@@ -456,6 +457,12 @@ const openAttachment = async (
   },
   pendingPopup?: Window | null,
 ) => {
+  const inlineType = getInlineAttachmentType(attachment.mimeType);
+  if (!inlineType) {
+    pendingPopup?.close();
+    await downloadAttachment(attachment);
+    return;
+  }
   try {
     const attachmentData = attachment.body;
 
@@ -465,7 +472,7 @@ const openAttachment = async (
       byteNumbers[i] = byteCharacters.charCodeAt(i);
     }
     const byteArray = new Uint8Array(byteNumbers);
-    const blob = new Blob([byteArray], { type: attachment.mimeType });
+    const blob = new Blob([byteArray], { type: inlineType });
     const url = window.URL.createObjectURL(blob);
 
     const popup = pendingPopup === undefined ? openAttachmentViewer() : pendingPopup;
