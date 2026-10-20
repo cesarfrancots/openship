@@ -38,6 +38,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import type { Sender, ParsedMessage, Attachment } from '@/types';
 import { useActiveConnection } from '@/hooks/use-connections';
 import { useAttachments } from '@/hooks/use-attachments';
+import { getOfficePreviewKind, renderOfficePreview } from '@/lib/office-preview';
 import { useTRPC } from '@/providers/query-provider';
 import { useThreadLabels } from '@/hooks/use-labels';
 import { useMutation } from '@tanstack/react-query';
@@ -465,7 +466,12 @@ const openAttachment = async (
       byteNumbers[i] = byteCharacters.charCodeAt(i);
     }
     const byteArray = new Uint8Array(byteNumbers);
-    const blob = new Blob([byteArray], { type: attachment.mimeType });
+    const officeKind = getOfficePreviewKind(attachment.mimeType, attachment.filename);
+    const blob = officeKind
+      ? new Blob([await renderOfficePreview(officeKind, byteArray, attachment.filename)], {
+          type: 'text/html',
+        })
+      : new Blob([byteArray], { type: attachment.mimeType });
     const url = window.URL.createObjectURL(blob);
 
     const popup = pendingPopup === undefined ? openAttachmentViewer() : pendingPopup;
