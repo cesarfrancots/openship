@@ -46,6 +46,16 @@ void app.whenReady().then(async () => {
     overrideBrowserWindowOptions: { show: false },
   }));
   window.webContents.on("did-create-window", (popup) => popups.push(popup));
+  // The renderer learns of a destroyed popup asynchronously, and reopening the
+  // named viewer before then reuses the dying window.
+  const closeViewer = async (popup: BrowserWindow) => {
+    popup.destroy();
+    const deadline = Date.now() + 5000;
+    while (!(await window.webContents.executeJavaScript("window.viewerClosed()"))) {
+      if (Date.now() > deadline) throw new Error("Attachment viewer did not close");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
   const script = `fetch('${origin}/executed')`;
   try {
     await window.loadURL(origin);
@@ -83,6 +93,15 @@ void app.whenReady().then(async () => {
       ["application/xml", "message.xml", `<root>${script}</root>`],
       ["", "unknown.html", `<script>${script}</script>`],
       ["text/plain, text/html", "invalid.html", `<script>${script}</script>`],
+      // An Office preview that cannot render downloads, never opens the raw blob.
+      [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "broken.xlsx",
+        "not a zip archive",
+      ],
+      ["text/html", "invoice.docx", `<script>${script}</script>`],
+      // Chromium silently drops script-started downloads after ten per window,
+      // so further cases need a new BrowserWindow.
     ];
     for (const [index, [mimeType, filename, payload]] of cases.entries()) {
       const output = join(directory, `download-${index}`);
@@ -92,7 +111,13 @@ void app.whenReady().then(async () => {
           5000,
         );
         window.webContents.session.once("will-download", (_event, item) => {
-          assert.equal(item.getFilename(), filename);
+          // A throw here would be uncaught in the main process and stall the run.
+          if (item.getFilename() !== filename) {
+            clearTimeout(timeout);
+            item.cancel();
+            reject(new Error(`Downloaded ${item.getFilename()} instead of ${filename}`));
+            return;
+          }
           item.setSavePath(output);
           item.once("done", (_event, state) => {
             clearTimeout(timeout);
@@ -126,7 +151,7 @@ void app.whenReady().then(async () => {
       () => !popup.webContents.isLoading() && popup.webContents.getURL().startsWith("blob:"),
     );
     assert.equal(await popup.webContents.executeJavaScript("document.body.textContent"), text);
-    popup.destroy();
+    await closeViewer(popup);
     const png = await window.webContents.executeJavaScript("window.pngAttachment()");
     const image = {
       mimeType: "IMAGE/PNG; name=image.png",
@@ -146,11 +171,39 @@ void app.whenReady().then(async () => {
       await popup.webContents.executeJavaScript("document.querySelector('img').naturalWidth"),
       1,
     );
-    popup.destroy();
+    await closeViewer(popup);
     await window.webContents.executeJavaScript(
       `window.openMailAttachment(${JSON.stringify(image)}, true)`,
       true,
     );
+    popups.length = 0;
+    const csv = `name,payload\nscript,<script>${script}</script>\nimage,"<img src=x onerror=""${script}"">"`;
+    await window.webContents.executeJavaScript(
+      `window.openMailAttachment(${JSON.stringify({ mimeType: "text/csv", filename: "report.csv", body: Buffer.from(csv).toString("base64"), attachmentId: "csv" })})`,
+      true,
+    );
+    await until(() => popups.length === 1);
+    popup = popups[0]!;
+    await until(
+      () =>
+        !popup.webContents.isLoading() &&
+        popup.webContents.getURL().startsWith("blob:") &&
+        popup.webContents.mainFrame.frames.length === 1,
+    );
+    const preview = popup.webContents.mainFrame.frames[0]!;
+    assert.equal(preview.origin, "null", "Generated previews render in an opaque origin");
+    assert.equal(
+      await popup.webContents.executeJavaScript(
+        "document.querySelector('iframe').getAttribute('sandbox')",
+      ),
+      "",
+    );
+    assert.match(
+      await popup.webContents.executeJavaScript("document.querySelector('iframe').srcdoc"),
+      /<td>&lt;script&gt;fetch/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await closeViewer(popup);
     assert.equal(executions, 0, "No attachment script ran in the webmail origin");
     console.log("Webmail attachment browser checks passed");
     app.exit(0);
